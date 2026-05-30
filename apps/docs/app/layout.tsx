@@ -11,10 +11,14 @@ import {
 import localFont from 'next/font/local';
 
 import './globals.css';
-import { type ProductId, PRODUCTS } from './product-config';
+import { Fragment } from 'react';
+
+import { WorkerPoolContext } from './(diffs)/_components/WorkerPoolContext';
 import { PreloadHighlighter } from '@/components/PreloadHighlighter';
+import { ScrollbarGutterVariables } from '@/components/ScrollbarGutterVariables';
 import { ThemeProvider } from '@/components/theme-provider';
 import { Toaster } from '@/components/ui/sonner';
+import { type ProductId, PRODUCTS } from '@/lib/product-config';
 
 const inter = Inter({
   variable: '--font-inter',
@@ -57,6 +61,11 @@ const geistMono = Geist_Mono({
 export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
+  userScalable: false,
+  ...(process.env.NEXT_PUBLIC_SITE === 'diffshub' && {
+    maximumScale: 1,
+    viewportFit: 'cover',
+  }),
 };
 
 // When running in a worktree, prefix the title with a stable emoji + slug so
@@ -88,16 +97,65 @@ function worktreeTitlePrefix(): string {
 
 const WORKTREE_PREFIX = worktreeTitlePrefix();
 
-// On `trees.software`, `icons` is intentionally omitted so the
-// file-convention assets in `app/trees/` (`icon.{ico,svg}`,
-// `apple-icon.png`) take over.
+// Per-site branding (icons, OG/twitter) is set here explicitly so the
+// dispatcher route at `app/page.tsx` (outside the route groups) inherits it.
 const SITE = (process.env.NEXT_PUBLIC_SITE ?? 'diffs') as ProductId;
-const isTrees = SITE === 'trees';
 const SITE_PRODUCT = PRODUCTS[SITE];
-const SITE_ORIGIN = isTrees ? 'https://trees.software' : 'https://diffs.com';
+const PROD_ORIGIN_BY_SITE: Record<ProductId, string> = {
+  diffs: 'https://diffs.com',
+  trees: 'https://trees.software',
+  diffshub: 'https://diffshub.com',
+};
+const DEV_PORT_BY_SITE: Record<ProductId, string> = {
+  diffs: '3690',
+  trees: '3691',
+  diffshub: '3692',
+};
+const PROD_ORIGIN = PROD_ORIGIN_BY_SITE[SITE];
+// In dev, point `metadataBase` at localhost so OG previewers fetch
+// in-progress assets instead of whatever's deployed.
+const isDev = process.env.NODE_ENV !== 'production';
+const DEV_PORT = process.env.PORT ?? DEV_PORT_BY_SITE[SITE];
+const SITE_ORIGIN = isDev ? `http://localhost:${DEV_PORT}` : PROD_ORIGIN;
 const baseTitle = `${SITE_PRODUCT.name}, from Pierre`;
 const taggedTitle = `${WORKTREE_PREFIX}${baseTitle}`;
 const description = SITE_PRODUCT.description;
+const SITE_ICONS_BY_SITE: Record<ProductId, Metadata['icons']> = {
+  diffs: {
+    icon: [
+      { url: '/favicon.svg', type: 'image/svg+xml' },
+      { url: '/favicon.png', type: 'image/png' },
+    ],
+    apple: '/diffs-brand/apple-icon.png',
+  },
+  trees: {
+    icon: [
+      { url: '/trees-brand/icon.svg', type: 'image/svg+xml' },
+      { url: '/trees-brand/icon.ico', sizes: 'any' },
+    ],
+    apple: '/trees-brand/apple-icon.png',
+  },
+  diffshub: {
+    icon: [
+      { url: '/diffshub-brand/icon.svg', type: 'image/svg+xml' },
+      { url: '/diffshub-brand/icon.ico', sizes: 'any' },
+    ],
+    apple: '/diffshub-brand/apple-icon.png',
+  },
+};
+const SITE_OG_IMAGE_BY_SITE: Record<ProductId, string> = {
+  diffs: '/diffs-brand/opengraph-image.png',
+  trees: '/trees-brand/opengraph-image.png',
+  diffshub: '/diffshub-brand/opengraph-image.png',
+};
+const SITE_TWITTER_IMAGE_BY_SITE: Record<ProductId, string> = {
+  diffs: '/diffs-brand/twitter-image.png',
+  trees: '/trees-brand/twitter-image.png',
+  diffshub: '/diffshub-brand/twitter-image.png',
+};
+const SITE_ICONS = SITE_ICONS_BY_SITE[SITE];
+const SITE_OG_IMAGE = SITE_OG_IMAGE_BY_SITE[SITE];
+const SITE_TWITTER_IMAGE = SITE_TWITTER_IMAGE_BY_SITE[SITE];
 const themeBootstrapScript = `(${String(function applyInitialTheme() {
   try {
     const storedTheme = window.localStorage.getItem('theme');
@@ -128,23 +186,14 @@ export const metadata: Metadata = {
     template: `${WORKTREE_PREFIX}%s`,
   },
   description,
-  ...(isTrees
-    ? {}
-    : {
-        icons: {
-          icon: [
-            { url: '/favicon.svg', type: 'image/svg+xml' },
-            { url: '/favicon.png', type: 'image/png' },
-          ],
-          apple: '/apple-touch-icon.png',
-        },
-      }),
+  icons: SITE_ICONS,
   openGraph: {
     title: {
       default: taggedTitle,
       template: `${WORKTREE_PREFIX}%s`,
     },
     description,
+    images: [SITE_OG_IMAGE],
   },
   twitter: {
     card: 'summary_large_image',
@@ -153,8 +202,11 @@ export const metadata: Metadata = {
       template: `${WORKTREE_PREFIX}%s`,
     },
     description,
+    images: [SITE_TWITTER_IMAGE],
   },
 };
+
+const WrapperContext = SITE === 'diffshub' ? WorkerPoolContext : Fragment;
 
 export default function RootLayout({
   children,
@@ -173,21 +225,24 @@ export default function RootLayout({
           dangerouslySetInnerHTML={{ __html: themeBootstrapScript }}
         />
       </head>
-      <body>
-        <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-          {children}
-          <Toaster />
-          <div
-            id="dark-mode-portal-container"
-            className="dark"
-            data-theme="dark"
-          ></div>
-          <div
-            id="light-mode-portal-container"
-            className="light"
-            data-theme="light"
-          ></div>
-        </ThemeProvider>
+      <body className={SITE}>
+        <ScrollbarGutterVariables />
+        <WrapperContext>
+          <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+            {children}
+            <Toaster />
+            <div
+              id="dark-mode-portal-container"
+              className="dark"
+              data-theme="dark"
+            ></div>
+            <div
+              id="light-mode-portal-container"
+              className="light"
+              data-theme="light"
+            ></div>
+          </ThemeProvider>
+        </WrapperContext>
         <PreloadHighlighter />
       </body>
     </html>

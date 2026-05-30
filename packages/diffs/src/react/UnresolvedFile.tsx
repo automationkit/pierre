@@ -10,6 +10,7 @@ import type {
   FileContents,
   HunkSeparators,
   MergeConflictResolution,
+  PostRenderPhase,
 } from '../types';
 import { type MergeConflictDiffAction } from '../utils/parseMergeConflictDiffFromFile';
 import type { FileDiffProps } from './FileDiff';
@@ -41,7 +42,8 @@ export interface UnresolvedFileReactOptions<LAnnotation>
   hunkSeparators?: HunkSeparators;
   onPostRender?(
     node: HTMLElement,
-    instance: UnresolvedFileClass<LAnnotation>
+    instance: UnresolvedFileClass<LAnnotation>,
+    phase: PostRenderPhase
   ): unknown;
   maxContextLines?: number;
 }
@@ -72,7 +74,6 @@ export function UnresolvedFile<LAnnotation = undefined>({
   renderHeaderPrefix,
   renderHeaderMetadata,
   renderGutterUtility,
-  renderHoverUtility,
   renderMergeConflictUtility,
   disableWorkerPool = false,
 }: UnresolvedFileProps<LAnnotation>): React.JSX.Element {
@@ -84,8 +85,7 @@ export function UnresolvedFile<LAnnotation = undefined>({
       selectedLines,
       prerenderedHTML,
       hasConflictUtility: renderMergeConflictUtility != null,
-      hasGutterRenderUtility:
-        renderGutterUtility != null || renderHoverUtility != null,
+      hasGutterRenderUtility: renderGutterUtility != null,
       hasCustomHeader: renderCustomHeader != null,
       disableWorkerPool,
     });
@@ -96,7 +96,6 @@ export function UnresolvedFile<LAnnotation = undefined>({
     renderHeaderMetadata,
     renderAnnotation,
     renderGutterUtility,
-    renderHoverUtility,
     lineAnnotations,
     getHoveredLine,
     actions,

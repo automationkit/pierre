@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, extname, join } from 'path';
 import { pathToFileURL } from 'url';
 
-import { PRODUCTS } from '../app/product-config';
-import type { ProductId } from '../app/product-config';
+import { PRODUCTS } from '../lib/product-config';
+import type { ProductId } from '../lib/product-config';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ const SECTION_DESCRIPTIONS: Record<string, Record<string, string>> = {
 };
 
 const MDX_FILENAME_OVERRIDES: Record<string, string> = {
-  'docs/Theming': 'docs-content.mdx',
+  '(diffs)/docs/Theming': 'docs-content.mdx',
 };
 
 const EXCLUDED_CONSTANTS = new Set([
@@ -144,11 +144,11 @@ const EXCLUDED_CONSTANTS = new Set([
   'THEMING_PALETTE_DARK',
 ]);
 
-const SEE_ALSO: Record<ProductId, Product['seeAlso']> = {
+const SEE_ALSO: Record<Exclude<ProductId, 'diffshub'>, Product['seeAlso']> = {
   diffs: [
     {
       label: '@pierre/trees',
-      url: 'https://diffs.com/trees/llms.txt',
+      url: 'https://trees.software/llms.txt',
       description: 'File tree rendering library',
     },
     {
@@ -165,7 +165,7 @@ const SEE_ALSO: Record<ProductId, Product['seeAlso']> = {
     },
     {
       label: 'Full documentation',
-      url: 'https://diffs.com/trees/llms-full.txt',
+      url: 'https://trees.software/llms-full.txt',
       description: 'Complete @pierre/trees docs in a single file',
     },
   ],
@@ -493,64 +493,82 @@ function generateLlmsFullTxt(product: Product): string {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-const PRODUCT_SECTIONS: Record<ProductId, readonly string[]> = {
+// Only the products that actually ship docs need llms.txt output. Stub
+// microsites (e.g. `diffshub`) have nothing to generate and intentionally
+// don't appear in these records or the SEE_ALSO map above.
+type LlmsProductId = Exclude<ProductId, 'diffshub'>;
+
+const PRODUCT_SECTIONS: Record<LlmsProductId, readonly string[]> = {
   diffs: DIFFS_SECTIONS,
   trees: TREES_SECTIONS,
 };
 
-const DOCS_PREFIX: Record<ProductId, string> = {
-  diffs: 'docs',
-  trees: 'trees/docs',
+const DOCS_PREFIX: Record<LlmsProductId, string> = {
+  diffs: '(diffs)/docs',
+  trees: '(trees)/docs',
 };
 
-const LLMS_DOCS_URL: Record<ProductId, string> = {
+const LLMS_DOCS_URL: Record<LlmsProductId, string> = {
   diffs: 'https://diffs.com/docs',
-  trees: 'https://diffs.com/trees/docs',
+  trees: 'https://trees.software/docs',
 };
+
+function resolveProductId(): LlmsProductId {
+  const site = process.env.NEXT_PUBLIC_SITE ?? 'diffs';
+  if (site !== 'diffs' && site !== 'trees') {
+    throw new Error(
+      `NEXT_PUBLIC_SITE must be 'diffs' or 'trees', got '${site}'`
+    );
+  }
+  return site;
+}
 
 async function main() {
-  for (const productId of ['diffs', 'trees'] as const) {
-    const config = PRODUCTS[productId];
-    const docsPrefix = DOCS_PREFIX[productId];
-    const sectionDirs = PRODUCT_SECTIONS[productId];
-
-    const sections = await Promise.all(
-      sectionDirs.map((dir) => buildSection(productId, docsPrefix, dir))
-    );
-
-    const docsUrl = LLMS_DOCS_URL[productId];
-    const llmsTxtPath =
-      productId === 'diffs'
-        ? join(ROOT, 'public', 'llms.txt')
-        : join(ROOT, 'public', productId, 'llms.txt');
-    const llmsFullTxtPath =
-      productId === 'diffs'
-        ? join(ROOT, 'public', 'llms-full.txt')
-        : join(ROOT, 'public', productId, 'llms-full.txt');
-
-    const product: Product = {
-      packageName: config.packageName,
-      description: config.llmsDescription,
-      docsUrl,
-      githubUrl: config.githubUrl,
-      sections,
-      llmsTxtPath,
-      llmsFullTxtPath,
-      seeAlso: SEE_ALSO[productId],
-    };
-
-    const llmsTxt = generateLlmsTxt(product);
-    const llmsFullTxt = generateLlmsFullTxt(product);
-
-    const dir = dirname(product.llmsTxtPath);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-    writeFileSync(product.llmsTxtPath, llmsTxt);
-    writeFileSync(product.llmsFullTxtPath, llmsFullTxt);
-
-    console.log(`wrote ${product.llmsTxtPath}`);
-    console.log(`wrote ${product.llmsFullTxtPath}`);
+  // Diffshub is a stub microsite with no MDX docs, so there is nothing to
+  // generate. Exit cleanly so the build pipeline succeeds for that site.
+  if ((process.env.NEXT_PUBLIC_SITE ?? 'diffs') === 'diffshub') {
+    console.log('diffshub has no docs; skipping llms.txt generation.');
+    return;
   }
+
+  // Each Vercel deployment (diffs.com vs trees.software) builds from the same
+  // codebase with NEXT_PUBLIC_SITE selecting the active product. Both sites
+  // share `public/`, so we generate exactly one product's files per build and
+  // always land them at `public/llms.txt` / `public/llms-full.txt`.
+  const productId = resolveProductId();
+  const config = PRODUCTS[productId];
+  const docsPrefix = DOCS_PREFIX[productId];
+  const sectionDirs = PRODUCT_SECTIONS[productId];
+
+  const sections = await Promise.all(
+    sectionDirs.map((dir) => buildSection(productId, docsPrefix, dir))
+  );
+
+  const llmsTxtPath = join(ROOT, 'public', 'llms.txt');
+  const llmsFullTxtPath = join(ROOT, 'public', 'llms-full.txt');
+
+  const product: Product = {
+    packageName: config.packageName,
+    description: config.llmsDescription,
+    docsUrl: LLMS_DOCS_URL[productId],
+    githubUrl: config.githubUrl,
+    sections,
+    llmsTxtPath,
+    llmsFullTxtPath,
+    seeAlso: SEE_ALSO[productId],
+  };
+
+  const llmsTxt = generateLlmsTxt(product);
+  const llmsFullTxt = generateLlmsFullTxt(product);
+
+  const dir = dirname(product.llmsTxtPath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  writeFileSync(product.llmsTxtPath, llmsTxt);
+  writeFileSync(product.llmsFullTxtPath, llmsFullTxt);
+
+  console.log(`wrote ${product.llmsTxtPath} (${productId})`);
+  console.log(`wrote ${product.llmsFullTxtPath} (${productId})`);
 }
 
 void main();

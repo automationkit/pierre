@@ -22,12 +22,15 @@ import {
 } from '../model/density';
 import { FileTreeController } from '../model/FileTreeController';
 import {
+  applyFileTreeGitStatusPatch,
   type FileTreeGitStatusState,
   resolveFileTreeGitStatusState,
 } from '../model/gitStatus';
+import type { FileTreeViewProps } from '../model/internalTypes';
 import type {
   FileTreeBatchOperation,
   FileTreeCompositionOptions,
+  FileTreeGitStatusPatch,
   FileTreeHydrationProps,
   FileTreeItemHandle,
   FileTreeListener,
@@ -36,15 +39,16 @@ import type {
   FileTreeMutationEventType,
   FileTreeMutationHandle,
   FileTreeOptions,
+  FileTreePublicId,
   FileTreeRemoveOptions,
   FileTreeRenderProps,
   FileTreeResetOptions,
   FileTreeRowDecorationRenderer,
+  FileTreeScrollToPathOptions,
   FileTreeSearchSessionHandle,
   FileTreeSelectionChangeListener,
   FileTreeSsrPayload,
-  FileTreeViewProps,
-} from '../model/types';
+} from '../model/publicTypes';
 import {
   FILE_TREE_DEFAULT_ITEM_HEIGHT,
   FILE_TREE_DEFAULT_VIEWPORT_HEIGHT,
@@ -84,9 +88,8 @@ function createServerId(explicitId?: string): string {
   return `pst_srv_${serverInstanceId}`;
 }
 
-// Translates the public row-budget hint into the provisional pixel height shared
-// by SSR and the first client render before the DOM can report a measured
-// scroll viewport.
+// Translates the public row-budget hint into the pixel height shared by SSR and
+// the first client render before the DOM can report a measured scroll viewport.
 function resolveInitialViewportHeight({
   initialVisibleRowCount,
   itemHeight,
@@ -336,6 +339,13 @@ export class FileTree
     this.#controller.focusPath(path);
   }
 
+  public scrollToPath(
+    path: FileTreePublicId,
+    options?: FileTreeScrollToPathOptions
+  ): void {
+    this.#controller.scrollToPath(path, options);
+  }
+
   public focusNearestPath(path: string | null): string | null {
     return this.#controller.focusNearestPath(path);
   }
@@ -346,6 +356,25 @@ export class FileTree
 
   public batch(operations: readonly FileTreeBatchOperation[]): void {
     this.#controller.batch(operations);
+  }
+
+  public applyGitStatusPatch(patch: FileTreeGitStatusPatch): void {
+    const nextGitStatusState = applyFileTreeGitStatusPatch(
+      this.#gitStatusState,
+      patch
+    );
+    if (nextGitStatusState === this.#gitStatusState) {
+      return;
+    }
+
+    this.#gitStatusState = nextGitStatusState;
+
+    const mountedTree = this.#getMountedTreeElements();
+    if (mountedTree == null) {
+      return;
+    }
+
+    renderFileTreeRoot(mountedTree.wrapper, this.#getViewProps());
   }
 
   public move(
@@ -429,10 +458,15 @@ export class FileTree
   }
 
   public setGitStatus(gitStatus?: FileTreeOptions['gitStatus']): void {
-    this.#gitStatusState = resolveFileTreeGitStatusState(
+    const nextGitStatusState = resolveFileTreeGitStatusState(
       gitStatus,
       this.#gitStatusState
     );
+    if (nextGitStatusState === this.#gitStatusState) {
+      return;
+    }
+
+    this.#gitStatusState = nextGitStatusState;
 
     const mountedTree = this.#getMountedTreeElements();
     if (mountedTree == null) {

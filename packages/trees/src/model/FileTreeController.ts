@@ -18,10 +18,27 @@ import {
   isSelfOrDescendantDrop,
   resolveDraggedPathsForStart,
 } from './dragAndDrop';
+import { resolveFileTreeInput } from './inputResolution';
 import type {
-  FileTreeBatchEvent,
-  FileTreeBatchOperation,
   FileTreeControllerListener,
+  FileTreeScrollRequest,
+  FileTreeStickyRowCandidate,
+} from './internalTypes';
+import {
+  isPathMutationEvent,
+  remapPathThroughMutation,
+  toTreesMutationEvent,
+} from './mutationEvents';
+import {
+  arePathSetsEqual,
+  getAncestorDirectoryPaths,
+  getImmediateParentPath,
+  getSiblingComparisonKey,
+  isCanonicalDirectoryPath,
+  toLowerCaseSearchPath,
+} from './pathHelpers';
+import type {
+  FileTreeBatchOperation,
   FileTreeControllerOptions,
   FileTreeDirectoryHandle,
   FileTreeDragAndDropConfig,
@@ -33,17 +50,23 @@ import type {
   FileTreeMutationEventForType,
   FileTreeMutationEventType,
   FileTreeMutationHandle,
-  FileTreeMutationSemanticEvent,
   FileTreeRemoveOptions,
   FileTreeRenameEvent,
   FileTreeRenamingConfig,
   FileTreeResetEvent,
   FileTreeResetOptions,
+  FileTreeScrollOffset,
+  FileTreeScrollToPathOptions,
   FileTreeSearchMode,
   FileTreeSearchSessionHandle,
-  FileTreeStickyRowCandidate,
   FileTreeVisibleRow,
-} from './types';
+} from './publicTypes';
+import {
+  getRenameLeafName,
+  toCanonicalRenamePath,
+  toRenameHelperPath,
+} from './renameHelpers';
+import { normalizeSearchQuery } from './searchHelpers';
 
 type ProjectionIndexBuffer = Int32Array<ArrayBufferLike>;
 
@@ -75,333 +98,16 @@ interface FileTreeStartRenamingOptions {
 
 export const FILE_TREE_RENAME_VIEW = Symbol('FILE_TREE_RENAME_VIEW');
 
-function isPathMutationEvent(
-  event: PathStoreEvent
-): event is Extract<
-  PathStoreEvent,
-  { operation: 'add' | 'remove' | 'move' | 'batch' }
-> {
-  return (
-    event.operation === 'add' ||
-    event.operation === 'remove' ||
-    event.operation === 'move' ||
-    event.operation === 'batch'
-  );
-}
-
 // Initial render only mounts a tiny viewport slice, so controller startup can
 // cap its first projection build and defer the full 494k-row metadata walk
 // until the user actually navigates outside that initial window.
 const INITIAL_PROJECTION_ROW_LIMIT = 512;
 const CONTEXT_VISIBLE_ROW_RANGE_LIMIT = 512;
 
-function arePathSetsEqual(
-  currentPaths: ReadonlySet<string>,
-  nextPaths: readonly string[]
-): boolean {
-  if (currentPaths.size !== nextPaths.length) {
-    return false;
-  }
-
-  for (const path of nextPaths) {
-    if (!currentPaths.has(path)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// Expanding a nested directory should make that directory visible, so this
-// helper walks its ancestor chain in canonical path form.
-function getAncestorDirectoryPaths(path: string): readonly string[] {
-  const normalizedPath = path.endsWith('/') ? path.slice(0, -1) : path;
-  if (normalizedPath.length === 0) {
-    return [];
-  }
-
-  const segments = normalizedPath.split('/');
-  return segments
-    .slice(0, -1)
-    .map((_, index) => `${segments.slice(0, index + 1).join('/')}/`);
-}
-
-function getImmediateParentPath(path: string): string | null {
-  const ancestorPaths = getAncestorDirectoryPaths(path);
-  return ancestorPaths.at(-1) ?? null;
-}
-
-function getSiblingComparisonKey(
-  path: string,
-  parentPath: string | null
-): string {
-  if (parentPath == null) {
-    return path;
-  }
-
-  return path.startsWith(parentPath) ? path.slice(parentPath.length) : path;
-}
-
-const normalizeSearchQuery = (value: string): string => {
-  const trimmedValue = value.trim();
-  if (trimmedValue.length === 0) {
-    return '';
-  }
-
-  const normalizedSeparators = trimmedValue.includes('\\')
-    ? trimmedValue.replaceAll('\\', '/')
-    : trimmedValue;
-  return normalizedSeparators.toLowerCase();
-};
-
-const toLowerCaseSearchPath = (path: string): string => path.toLowerCase();
-
-function isCanonicalDirectoryPath(path: string): boolean {
-  return path.endsWith('/');
-}
-
-// Rename parity is defined around basename edits, so this helper strips the
-// trailing slash from canonical directory paths before deriving the visible
-// editable leaf segment.
-function getRenameLeafName(path: string): string {
-  const normalizedPath = path.endsWith('/') ? path.slice(0, -1) : path;
-  const separatorIndex = normalizedPath.lastIndexOf('/');
-  return separatorIndex < 0
-    ? normalizedPath
-    : normalizedPath.slice(separatorIndex + 1);
-}
-
-// The legacy rename helper reports folder paths without a trailing slash, but
-// the path-store mutation layer still moves canonical directory paths with `/`.
-function toRenameHelperPath(path: string): string {
-  return path.endsWith('/') ? path.slice(0, -1) : path;
-}
-
-function toCanonicalRenamePath(path: string, isFolder: boolean): string {
-  return isFolder && !path.endsWith('/') ? `${path}/` : path;
-}
-
-// Applies a directory/file move to a tracked public path so focus/selection can
-// follow moved items instead of falling back as if they were deleted.
-function remapMovedPath(
-  path: string,
-  fromPath: string,
-  toPath: string
-): string {
-  if (path === fromPath) {
-    return toPath;
-  }
-
-  const descendantPrefix = fromPath.endsWith('/') ? fromPath : `${fromPath}/`;
-  if (!path.startsWith(descendantPrefix)) {
-    return path;
-  }
-
-  const targetPrefix = toPath.endsWith('/') ? toPath : `${toPath}/`;
-  return `${targetPrefix}${path.slice(descendantPrefix.length)}`;
-}
-
-// Determines whether a tracked public path disappeared because a remove event
-// deleted that exact item or a whole removed directory subtree.
-function isPathRemoved(path: string, removedPath: string): boolean {
-  if (path === removedPath) {
-    return true;
-  }
-
-  const descendantPrefix = removedPath.endsWith('/')
-    ? removedPath
-    : `${removedPath}/`;
-  return path.startsWith(descendantPrefix);
-}
-
-// Rewrites focus/selection paths through mutation events so controller state
-// stays aligned with the mutated topology before the next projection rebuild.
-function remapPathThroughMutation(
-  path: string | null,
-  event: PathStoreEvent,
-  preserveRemovedPath: boolean = false
-): string | null {
-  if (path == null) {
-    return null;
-  }
-
-  switch (event.operation) {
-    case 'add':
-    case 'expand':
-    case 'collapse':
-    case 'mark-directory-unloaded':
-    case 'begin-child-load':
-    case 'apply-child-patch':
-    case 'complete-child-load':
-    case 'fail-child-load':
-    case 'cleanup':
-      return path;
-    case 'remove':
-      return isPathRemoved(path, event.path)
-        ? preserveRemovedPath
-          ? path
-          : null
-        : path;
-    case 'move':
-      return remapMovedPath(path, event.from, event.to);
-    case 'batch': {
-      let nextPath: string | null = path;
-      for (const childEvent of event.events) {
-        nextPath = remapPathThroughMutation(
-          nextPath,
-          childEvent,
-          preserveRemovedPath
-        );
-        if (nextPath == null) {
-          return null;
-        }
-      }
-      return nextPath;
-    }
-  }
-}
-
-function createMutationInvalidation(event: PathStoreEvent): {
-  canonicalChanged: boolean;
-  projectionChanged: boolean;
-  visibleCountDelta: number | null;
-} {
-  return {
-    canonicalChanged: event.canonicalChanged,
-    projectionChanged: event.projectionChanged,
-    visibleCountDelta: event.visibleCountDelta,
-  };
-}
-
-function haveMatchingPaths(
-  currentPaths: readonly string[],
-  preparedPaths: readonly string[]
-): boolean {
-  if (currentPaths === preparedPaths) {
-    return true;
-  }
-
-  if (currentPaths.length !== preparedPaths.length) {
-    return false;
-  }
-
-  for (let index = 0; index < currentPaths.length; index += 1) {
-    if (currentPaths[index] !== preparedPaths[index]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// Keeps raw path lists and prepared input aligned so callers cannot silently
-// reuse stale prepared data after the tree source changes.
-function resolveFileTreeInput(
-  options: Pick<FileTreeControllerOptions, 'paths' | 'preparedInput'>,
-  context: 'constructor' | 'resetPaths',
-  sort: FileTreeControllerOptions['sort']
-): {
-  paths: readonly string[];
-  preparedInput: FileTreePreparedInput | undefined;
-} {
-  const { paths, preparedInput } = options;
-  if (preparedInput == null) {
-    if (paths == null) {
-      throw new Error('FileTree requires paths or preparedInput');
-    }
-
-    return {
-      paths,
-      preparedInput: undefined,
-    };
-  }
-
-  const preparedPaths = preparedInput.paths;
-  if (paths == null) {
-    return {
-      paths: preparedPaths,
-      preparedInput,
-    };
-  }
-
-  const comparablePaths = PathStore.preparePaths(
-    paths,
-    sort == null ? {} : { sort }
-  );
-  if (!haveMatchingPaths(comparablePaths, preparedPaths)) {
-    throw new Error(
-      `FileTree ${context} received paths and preparedInput for different path lists`
-    );
-  }
-
-  return {
-    paths: preparedPaths,
-    preparedInput,
-  };
-}
-
-function toTreesMutationSemanticEvent(
-  event: Extract<PathStoreEvent, { operation: 'add' | 'remove' | 'move' }>
-): FileTreeMutationSemanticEvent {
-  switch (event.operation) {
-    case 'add':
-      return {
-        ...createMutationInvalidation(event),
-        operation: 'add',
-        path: event.path,
-      };
-    case 'remove':
-      return {
-        ...createMutationInvalidation(event),
-        operation: 'remove',
-        path: event.path,
-        recursive: event.recursive,
-      };
-    case 'move':
-      return {
-        ...createMutationInvalidation(event),
-        from: event.from,
-        operation: 'move',
-        to: event.to,
-      };
-  }
-}
-
-function toTreesBatchEvent(
-  event: Extract<PathStoreEvent, { operation: 'batch' }>
-): FileTreeBatchEvent {
-  return {
-    ...createMutationInvalidation(event),
-    events: event.events
-      .filter(
-        (
-          childEvent
-        ): childEvent is Extract<
-          PathStoreEvent,
-          { operation: 'add' | 'remove' | 'move' }
-        > =>
-          childEvent.operation === 'add' ||
-          childEvent.operation === 'remove' ||
-          childEvent.operation === 'move'
-      )
-      .map((childEvent) => toTreesMutationSemanticEvent(childEvent)),
-    operation: 'batch',
-  };
-}
-
-function toTreesMutationEvent(
-  event: PathStoreEvent
-): FileTreeMutationEvent | null {
-  switch (event.operation) {
-    case 'add':
-    case 'remove':
-    case 'move':
-      return toTreesMutationSemanticEvent(event);
-    case 'batch':
-      return toTreesBatchEvent(event);
-    default:
-      return null;
-  }
+function normalizeScrollOffset(
+  offset: FileTreeScrollToPathOptions['offset']
+): FileTreeScrollOffset {
+  return offset === 'top' || offset === 'center' ? offset : 'nearest';
 }
 
 // Keeps focus resolution cheap after expand/collapse by asking for only the
@@ -485,8 +191,8 @@ function createVisibleProjection(
 }
 
 /**
- * Owns the live PathStore instance and exposes a small path-first boundary we
- * can evolve in later phases without leaking internal store IDs.
+ * Owns the live PathStore instance and exposes a path-first boundary without
+ * leaking internal store IDs.
  */
 export class FileTreeController
   implements FileTreeMutationHandle, FileTreeSearchSessionHandle
@@ -531,6 +237,8 @@ export class FileTreeController
   #searchVisibleIndexByPath: Map<string, number> | null = null;
   #searchVisibleIndices: readonly number[] | null = null;
   #searchVisiblePaths: readonly string[] | null = null;
+  #scrollRequest: FileTreeScrollRequest | null = null;
+  #scrollRequestId = 0;
   #selectionAnchorPath: string | null = null;
   #selectedPaths = new Set<string>();
   #selectionVersion = 0;
@@ -648,6 +356,40 @@ export class FileTreeController
     }
   }
 
+  // Records a one-shot scroll request for the mounted view. By default the
+  // target also becomes the model-focused row; callers can pass `focus: false`
+  // to reveal a row without changing model focus or DOM focus.
+  public scrollToPath(
+    path: string,
+    options?: FileTreeScrollToPathOptions
+  ): void {
+    const resolvedPath = this.#store.getPathInfo(path)?.path ?? null;
+    if (resolvedPath == null) {
+      return;
+    }
+
+    this.#ensureFullProjection();
+    const targetIndex = this.#getExactCurrentVisibleIndexByPath(resolvedPath);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const targetPath = this.#resolveVisiblePathAtIndex(targetIndex);
+    if (targetPath == null) {
+      return;
+    }
+
+    if (options?.focus !== false) {
+      this.#setFocusedIndex(targetIndex, false);
+    }
+    this.#scrollRequest = {
+      id: (this.#scrollRequestId += 1),
+      offset: normalizeScrollOffset(options?.offset),
+      visibleIndex: targetIndex,
+    };
+    this.#emit();
+  }
+
   // DOM row events already know the target row is mounted, so they can focus it
   // by path without materializing every visible row in large open trees.
   public focusMountedPathFromInput(path: string): void {
@@ -693,6 +435,16 @@ export class FileTreeController
 
   public getFocusedPath(): string | null {
     return this.#focusedPath;
+  }
+
+  public getScrollRequest(): FileTreeScrollRequest | null {
+    return this.#scrollRequest;
+  }
+
+  public clearScrollRequest(id: number): void {
+    if (this.#scrollRequest?.id === id) {
+      this.#scrollRequest = null;
+    }
   }
 
   public resolveNearestVisiblePath(path: string | null): string | null {
@@ -888,7 +640,7 @@ export class FileTreeController
   }
 
   /**
-   * Returns the minimal Phase 2/3 item handle for the given path.
+   * Returns the item handle for the given path.
    *
    * Accepts both canonical directory paths (`src/`) and bare directory lookup
    * paths (`src`) so callers do not need to know the canonical slash rules.
@@ -1984,6 +1736,14 @@ export class FileTreeController
 
   #getCurrentVisiblePaths(): readonly string[] {
     return this.#searchVisiblePaths ?? this.#projectionPaths;
+  }
+
+  #getExactCurrentVisibleIndexByPath(path: string): number {
+    if (this.#searchVisiblePaths != null) {
+      return this.#searchVisibleIndexByPath?.get(path) ?? -1;
+    }
+
+    return this.#store.getVisibleIndex(path) ?? -1;
   }
 
   #getProjectionIndexFromVisibleIndex(index: number): number {

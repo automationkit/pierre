@@ -85,13 +85,33 @@ const DropdownMenuContent = React.forwardRef<
     const localRef = React.useRef<React.ElementRef<
       typeof DropdownMenuPrimitive.Content
     > | null>(null);
+    const scrollFrameRef = React.useRef<number | null>(null);
 
     const setRefs = React.useCallback(
       (node: React.ElementRef<typeof DropdownMenuPrimitive.Content> | null) => {
-        localRef.current = node;
+        const scrollIntoView =
+          node != null && scrollSelectedIntoView && localRef.current !== node;
 
-        if (node != null && scrollSelectedIntoView) {
-          requestAnimationFrame(() => {
+        // Radix/Floating UI calls this ref super aggressively with null and
+        // the same component quite a lot, resulting in false positives for
+        // scrollIntoView. This is a bunch of code that's annoying to reason
+        // about to work around this.
+        if (node != null) {
+          localRef.current = node;
+        }
+
+        if (scrollIntoView) {
+          if (scrollFrameRef.current != null) {
+            cancelAnimationFrame(scrollFrameRef.current);
+          }
+
+          scrollFrameRef.current = requestAnimationFrame(() => {
+            scrollFrameRef.current = null;
+
+            if (localRef.current !== node || !node.isConnected) {
+              return;
+            }
+
             node
               .querySelector<HTMLElement>(selectedItemSelector)
               ?.scrollIntoView({ block: 'nearest' });
@@ -107,13 +127,23 @@ const DropdownMenuContent = React.forwardRef<
       [ref, scrollSelectedIntoView, selectedItemSelector]
     );
 
+    React.useEffect(
+      () => () => {
+        localRef.current = null;
+        if (scrollFrameRef.current != null) {
+          cancelAnimationFrame(scrollFrameRef.current);
+        }
+      },
+      []
+    );
+
     return (
       <DropdownMenuPrimitive.Portal container={container}>
         <DropdownMenuPrimitive.Content
           ref={setRefs}
           sideOffset={sideOffset}
           className={cn(
-            'bg-popover text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] space-y-[1px] overflow-hidden rounded-lg border border-[rgb(0_0_0_/_0.15)] bg-clip-padding p-1 shadow-md dark:border-[rgb(255_255_255_/_0.15)] dark:shadow-black/25',
+            'bg-popover text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] space-y-[1px] overflow-hidden rounded-lg border border-[rgb(0_0_0_/_0.1)] bg-clip-padding p-1 shadow-lg dark:border-[rgb(255_255_255_/_0.15)] dark:shadow-black/25',
             className
           )}
           {...props}

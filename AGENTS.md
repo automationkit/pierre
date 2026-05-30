@@ -102,7 +102,9 @@ bun run format
 ```
 
 **Important:** Always run `bun run format` from the monorepo root after making
-changes to ensure consistent formatting.
+changes to ensure consistent formatting. For code changes, verification is not
+complete until you have also run `bun run lint` from the monorepo root and the
+relevant `bun run tsc` typecheck.
 
 - Always preserve trailing newlines at the end of files.
 
@@ -139,6 +141,10 @@ We use project references between packages and apps.
 - Keep comments concrete and behavior-focused. Good comments usually explain
   what data is being transformed, what invariant is being checked, or what the
   helper is protecting against.
+- After changing boolean logic or invalidation paths, simplify the final control
+  flow before calling the work done. If code is already inside `if (foo)`, don't
+  keep `|| foo` in assignments inside that block. Prefer direct values that make
+  the invariant obvious.
 
 ## Performance
 

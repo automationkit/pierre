@@ -4,6 +4,7 @@ import { toHtml } from 'hast-util-to-html';
 import {
   CUSTOM_HEADER_SLOT_ID,
   DEFAULT_THEMES,
+  DEFAULT_TOKENIZE_MAX_LENGTH,
   DIFFS_TAG_NAME,
   EMPTY_RENDER_RANGE,
   HEADER_METADATA_SLOT_ID,
@@ -16,7 +17,7 @@ import {
   InteractionManager,
   type InteractionManagerBaseOptions,
   pluckInteractionOptions,
-  type SelectedLineRange,
+  type SelectionWriteOptions,
 } from '../managers/InteractionManager';
 import { ResizeManager } from '../managers/ResizeManager';
 import { FileRenderer, type FileRenderResult } from '../renderers/FileRenderer';
@@ -26,23 +27,34 @@ import type {
   BaseCodeOptions,
   FileContents,
   LineAnnotation,
+  PostRenderPhase,
   PrePropertiesConfig,
   RenderFileMetadata,
   RenderRange,
+  SelectedLineRange,
   ThemeTypes,
 } from '../types';
 import { areFilesEqual } from '../utils/areFilesEqual';
 import { areLineAnnotationsEqual } from '../utils/areLineAnnotationsEqual';
 import { arePrePropertiesEqual } from '../utils/arePrePropertiesEqual';
 import { areRenderRangesEqual } from '../utils/areRenderRangesEqual';
+import { areThemesEqual } from '../utils/areThemesEqual';
 import { createAnnotationWrapperNode } from '../utils/createAnnotationWrapperNode';
 import { createGutterUtilityContentNode } from '../utils/createGutterUtilityContentNode';
 import { createUnsafeCSSStyleNode } from '../utils/createUnsafeCSSStyleNode';
-import { wrapThemeCSS, wrapUnsafeCSS } from '../utils/cssWrappers';
+import {
+  patchScrollbarGutterSize,
+  wrapThemeCSS,
+  wrapUnsafeCSS,
+} from '../utils/cssWrappers';
+import { getFileRendererOptions } from '../utils/getFileRendererOptions';
 import { getLineAnnotationName } from '../utils/getLineAnnotationName';
 import { getOrCreateCodeNode } from '../utils/getOrCreateCodeNode';
 import { upsertHostThemeStyle } from '../utils/hostTheme';
+import { isFilePlainText } from '../utils/isFilePlainText';
+import { isStyleNode } from '../utils/isStyleNode';
 import { prerenderHTMLIfNecessary } from '../utils/prerenderHTMLIfNecessary';
+import { getMeasuredScrollbarGutter } from '../utils/scrollbarGutter';
 import { setPreNodeProperties } from '../utils/setWrapperNodeProps';
 import type { WorkerPoolManager } from '../worker';
 import { DiffsContainerLoaded } from './web-components';
@@ -53,6 +65,7 @@ export interface FileRenderProps<LAnnotation> {
   file: FileContents;
   fileContainer?: HTMLElement;
   containerWrapper?: HTMLElement;
+  deferManagers?: boolean;
   forceRender?: boolean;
   preventEmit?: boolean;
   lineAnnotations?: LineAnnotation<LAnnotation>[];
@@ -70,12 +83,8 @@ export interface FileHydrateProps<LAnnotation> extends Omit<
 export interface FileOptions<LAnnotation>
   extends BaseCodeOptions, InteractionManagerBaseOptions<'file'> {
   disableFileHeader?: boolean;
-  /**
-   * @deprecated Use `enableGutterUtility` instead.
-   */
-  enableHoverUtility?: boolean;
   renderHeaderPrefix?: RenderFileMetadata;
-  renderCustomMetadata?: RenderFileMetadata;
+  renderHeaderMetadata?: RenderFileMetadata;
   renderCustomHeader?: RenderFileMetadata;
   /**
    * When true, errors during rendering are rethrown instead of being caught
@@ -89,14 +98,12 @@ export interface FileOptions<LAnnotation>
   renderGutterUtility?(
     getHoveredRow: () => GetHoveredLineResult<'file'> | undefined
   ): HTMLElement | null | undefined;
-  /**
-   * @deprecated Use `renderGutterUtility` instead.
-   */
-  renderHoverUtility?(
-    getHoveredRow: () => GetHoveredLineResult<'file'> | undefined
-  ): HTMLElement | null | undefined;
 
-  onPostRender?(node: HTMLElement, instance: File<LAnnotation>): unknown;
+  onPostRender?(
+    node: HTMLElement,
+    instance: File<LAnnotation>,
+    phase: PostRenderPhase
+  ): unknown;
 }
 
 interface AnnotationElementCache<LAnnotation> {
@@ -120,6 +127,7 @@ export class File<LAnnotation = undefined> {
   static LoadedCustomComponent: boolean = DiffsContainerLoaded;
 
   readonly __id: string = `file:${++instanceId}`;
+  readonly type = 'file';
 
   protected fileContainer: HTMLElement | undefined;
   protected spriteSVG: SVGElement | undefined;
@@ -129,14 +137,17 @@ export class File<LAnnotation = undefined> {
   protected bufferAfter: HTMLElement | undefined;
   protected themeCSSStyle: HTMLStyleElement | undefined;
   protected appliedThemeCSS: AppliedThemeStyleCache | undefined;
+  protected hasAdoptedThemeCSS = false;
   protected unsafeCSSStyle: HTMLStyleElement | undefined;
   protected appliedUnsafeCSS: string | undefined;
   protected gutterUtilityContent: HTMLElement | undefined;
   protected errorWrapper: HTMLElement | undefined;
   protected placeHolder: HTMLElement | undefined;
   protected lastRenderedHeaderHTML: string | undefined;
+  protected cachedHeaderHTML: string | undefined;
   protected appliedPreAttributes: PrePropertiesConfig | undefined;
   protected lastRowCount: number | undefined;
+  private mounted = false;
 
   protected headerElement: HTMLElement | undefined;
   protected headerCustom: HTMLElement | undefined;
@@ -150,9 +161,11 @@ export class File<LAnnotation = undefined> {
   protected annotationCache: Map<string, AnnotationElementCache<LAnnotation>> =
     new Map();
   protected lineAnnotations: LineAnnotation<LAnnotation>[] = [];
+  protected managersDirty = false;
 
-  protected file: FileContents | undefined;
+  public file: FileContents | undefined;
   protected renderRange: RenderRange | undefined;
+  protected enabled = true;
 
   constructor(
     public options: FileOptions<LAnnotation> = { theme: DEFAULT_THEMES },
@@ -177,7 +190,7 @@ export class File<LAnnotation = undefined> {
   };
 
   public rerender(): void {
-    if (this.file == null) return;
+    if (!this.enabled || this.file == null) return;
     this.render({
       file: this.file,
       forceRender: true,
@@ -185,10 +198,20 @@ export class File<LAnnotation = undefined> {
     });
   }
 
+  public onThemeChange(): void {
+    this.fileRenderer.clearRenderCache();
+    this.rerender();
+  }
+
   public setOptions(options: FileOptions<LAnnotation> | undefined): void {
     if (options == null) return;
     this.options = options;
-    this.interactionManager.setOptions(pluckInteractionOptions(options));
+    this.cachedHeaderHTML = undefined;
+    this.syncInteractionOptions();
+  }
+
+  protected syncInteractionOptions(): void {
+    this.interactionManager.setOptions(pluckInteractionOptions(this.options));
   }
 
   private mergeOptions(options: Partial<FileOptions<LAnnotation>>): void {
@@ -200,18 +223,37 @@ export class File<LAnnotation = undefined> {
       return;
     }
     this.mergeOptions({ themeType });
+    this.applyCachedThemeState(themeType);
+  }
+
+  private applyCachedThemeState(themeType: ThemeTypes): boolean {
     if (
       typeof this.options.theme === 'string' ||
       this.fileContainer == null ||
       this.appliedThemeCSS == null
     ) {
-      return;
+      return false;
+    }
+    const effectiveThemeType = this.appliedThemeCSS.baseThemeType ?? themeType;
+    if (this.appliedThemeCSS.themeType === effectiveThemeType) {
+      return false;
     }
     this.applyThemeState(
       this.fileContainer,
       this.appliedThemeCSS.themeStyles,
       themeType,
       this.appliedThemeCSS.baseThemeType
+    );
+    return true;
+  }
+
+  private hasThemeChanged(): boolean {
+    return (
+      this.appliedThemeCSS != null &&
+      !areThemesEqual(
+        this.appliedThemeCSS.theme,
+        this.options.theme ?? DEFAULT_THEMES
+      )
     );
   }
 
@@ -225,29 +267,41 @@ export class File<LAnnotation = undefined> {
     this.lineAnnotations = lineAnnotations;
   }
 
-  public setSelectedLines(range: SelectedLineRange | null): void {
-    this.interactionManager.setSelection(range);
+  public setSelectedLines(
+    range: SelectedLineRange | null,
+    options?: SelectionWriteOptions
+  ): void {
+    this.interactionManager.setSelection(range, options);
   }
 
-  public cleanUp(): void {
-    this.fileRenderer.cleanUp();
+  public flushManagers(): void {
+    if (!this.managersDirty || this.pre == null) {
+      this.managersDirty = false;
+      return;
+    }
+
+    const { overflow = 'scroll' } = this.options;
+    this.interactionManager.setup(this.pre);
+    this.resizeManager.setup(this.pre, overflow === 'wrap');
+    this.managersDirty = false;
+  }
+
+  public cleanUp(recycle = false): void {
+    this.emitPostRender(true);
     this.resizeManager.cleanUp();
     this.interactionManager.cleanUp();
+    this.managersDirty = false;
     this.workerManager?.unsubscribeToThemeChanges(this);
-    this.workerManager = undefined;
     this.renderRange = undefined;
-
-    // Clean up the data
-    this.file = undefined;
 
     // Clean up the elements
     if (!this.isContainerManaged) {
       this.fileContainer?.remove();
     }
-    if (this.fileContainer?.shadowRoot != null) {
-      this.fileContainer.shadowRoot.innerHTML = '';
-    }
     this.fileContainer = undefined;
+    this.mounted = false;
+    this.lineAnnotations = [];
+    this.annotationCache.clear();
     this.pre = undefined;
     this.bufferBefore = undefined;
     this.bufferAfter = undefined;
@@ -258,12 +312,32 @@ export class File<LAnnotation = undefined> {
     this.headerMetadata = undefined;
     this.headerCustom = undefined;
     this.lastRenderedHeaderHTML = undefined;
+    if (!recycle) {
+      this.cachedHeaderHTML = undefined;
+    }
     this.errorWrapper = undefined;
     this.themeCSSStyle = undefined;
     this.appliedThemeCSS = undefined;
+    this.hasAdoptedThemeCSS = false;
     this.unsafeCSSStyle = undefined;
     this.appliedUnsafeCSS = undefined;
     this.placeHolder = undefined;
+    this.unsafeCSSStyle = undefined;
+
+    if (recycle) {
+      this.fileRenderer.recycle();
+    } else {
+      this.fileRenderer.cleanUp();
+      this.workerManager = undefined;
+      this.file = undefined;
+    }
+
+    this.enabled = false;
+  }
+
+  public virtualizedSetup(): void {
+    this.enabled = true;
+    this.workerManager?.subscribeToThemeChanges(this);
   }
 
   public hydrate(props: FileHydrateProps<LAnnotation>): void {
@@ -275,9 +349,14 @@ export class File<LAnnotation = undefined> {
       lineAnnotations,
     } = props;
     this.hydrateElements(fileContainer, prerenderedHTML);
-    // If we have no pre tag and header tag, then something probably didn't
-    // pre-render and we should kick off a render.
-    if (this.pre == null && this.headerElement == null) {
+    if (
+      shouldRenderCode(this.pre, file, this.options.collapsed) ||
+      shouldRenderHeader(
+        this.headerElement,
+        file,
+        this.options.disableFileHeader
+      )
+    ) {
       this.render({ ...props, preventEmit: true });
     }
     // Otherwise orchestrate our setup.
@@ -293,6 +372,9 @@ export class File<LAnnotation = undefined> {
     fileContainer: HTMLElement,
     prerenderedHTML: string | undefined
   ): void {
+    if (this.fileContainer !== fileContainer) {
+      this.emitPostRender(true);
+    }
     prerenderHTMLIfNecessary(fileContainer, prerenderedHTML);
     for (const element of Array.from(
       fileContainer.shadowRoot?.children ?? []
@@ -334,23 +416,18 @@ export class File<LAnnotation = undefined> {
       this.syncCodeNodeFromPre(this.pre);
       this.pre.removeAttribute('data-dehydrated');
     }
-    if (this.pre != null || this.headerElement != null) {
-      this.fileContainer = fileContainer;
-    }
+    this.fileContainer = fileContainer;
+    this.hydrateMeasuredScrollbar();
   }
 
   protected hydrationSetup({
     file,
     lineAnnotations,
   }: HydrationSetup<LAnnotation>): void {
-    const { overflow = 'scroll' } = this.options;
     this.lineAnnotations = lineAnnotations ?? this.lineAnnotations;
     this.file = file;
-    this.fileRenderer.setOptions({
-      ...this.options,
-      headerRenderMode:
-        this.options.renderCustomHeader != null ? 'custom' : 'default',
-    });
+    this.fileRenderer.setOptions(getFileRendererOptions(this.options));
+    this.syncInteractionOptions();
     if (this.pre == null) {
       return;
     }
@@ -358,8 +435,8 @@ export class File<LAnnotation = undefined> {
     this.renderAnnotations();
     this.renderGutterUtility();
     this.injectUnsafeCSS();
-    this.interactionManager.setup(this.pre);
-    this.resizeManager.setup(this.pre, overflow === 'wrap');
+    this.managersDirty = true;
+    this.flushManagers();
   }
 
   public getOrCreateLineCache(
@@ -376,12 +453,19 @@ export class File<LAnnotation = undefined> {
     forceRender = false,
     preventEmit = false,
     containerWrapper,
+    deferManagers = false,
     lineAnnotations,
     renderRange,
   }: FileRenderProps<LAnnotation>): boolean {
     const { collapsed = false, themeType = 'system' } = this.options;
+    if (!this.enabled) {
+      throw new Error(
+        'File.render: attempting to call render after cleaned up'
+      );
+    }
     const nextRenderRange = collapsed ? undefined : renderRange;
     const previousRenderRange = this.renderRange;
+    const themeChanged = this.hasThemeChanged();
     const annotationsChanged =
       lineAnnotations != null &&
       (lineAnnotations.length > 0 || this.lineAnnotations.length > 0)
@@ -393,28 +477,26 @@ export class File<LAnnotation = undefined> {
       !forceRender &&
       areRenderRangesEqual(nextRenderRange, this.renderRange) &&
       !didFileChange &&
-      !annotationsChanged
+      !annotationsChanged &&
+      !themeChanged
     ) {
-      return false;
+      return this.applyCachedThemeState(themeType);
     }
 
     this.renderRange = nextRenderRange;
+    if (didFileChange) {
+      this.cachedHeaderHTML = undefined;
+    }
     this.file = file;
-    this.fileRenderer.setOptions({
-      ...this.options,
-      headerRenderMode:
-        this.options.renderCustomHeader != null ? 'custom' : 'default',
-    });
+    this.fileRenderer.setOptions(getFileRendererOptions(this.options));
+    this.syncInteractionOptions();
     if (lineAnnotations != null) {
       this.setLineAnnotations(lineAnnotations);
     }
     this.fileRenderer.setLineAnnotations(this.lineAnnotations);
 
-    const {
-      disableErrorHandling = false,
-      disableFileHeader = false,
-      overflow = 'scroll',
-    } = this.options;
+    const { disableErrorHandling = false, disableFileHeader = false } =
+      this.options;
     if (disableFileHeader) {
       // Remove existing header from DOM
       if (this.headerElement != null) {
@@ -429,6 +511,7 @@ export class File<LAnnotation = undefined> {
       fileContainer,
       containerWrapper
     );
+    this.applyCachedThemeState(themeType);
 
     if (collapsed) {
       this.removeRenderedCode();
@@ -472,7 +555,7 @@ export class File<LAnnotation = undefined> {
         !this.canPartiallyRender(
           forceRender,
           annotationsChanged,
-          didFileChange
+          didFileChange || themeChanged
         ) ||
         !this.applyPartialRender(previousRenderRange, nextRenderRange)
       ) {
@@ -497,8 +580,10 @@ export class File<LAnnotation = undefined> {
 
       this.applyBuffers(pre, nextRenderRange);
       this.injectUnsafeCSS();
-      this.interactionManager.setup(pre);
-      this.resizeManager.setup(pre, overflow === 'wrap');
+      this.managersDirty = true;
+      if (!deferManagers) {
+        this.flushManagers();
+      }
       this.renderAnnotations();
       this.renderGutterUtility();
     } catch (error: unknown) {
@@ -516,10 +601,31 @@ export class File<LAnnotation = undefined> {
     return true;
   }
 
-  private emitPostRender() {
-    if (this.fileContainer != null) {
-      this.options.onPostRender?.(this.fileContainer, this);
+  private emitPostRender(unmount = false) {
+    const {
+      fileContainer,
+      options: { onPostRender },
+    } = this;
+
+    if (unmount) {
+      if (!this.mounted) {
+        return;
+      }
+      this.mounted = false;
+      if (fileContainer == null) {
+        return;
+      }
+      onPostRender?.(fileContainer, this, 'unmount');
+      return;
     }
+
+    if (fileContainer == null) {
+      return;
+    }
+
+    const phase: PostRenderPhase = this.mounted ? 'update' : 'mount';
+    this.mounted = true;
+    onPostRender?.(fileContainer, this, phase);
   }
 
   private removeRenderedCode(): void {
@@ -566,6 +672,7 @@ export class File<LAnnotation = undefined> {
     if (this.fileContainer == null) {
       return false;
     }
+    this.emitPostRender(true);
     this.cleanChildNodes();
 
     if (this.placeHolder == null) {
@@ -578,6 +685,26 @@ export class File<LAnnotation = undefined> {
     }
     this.placeHolder.style.setProperty('height', `${height}px`);
     return true;
+  }
+
+  public primeHighlightCache(): void {
+    const { file, workerManager } = this;
+    if (
+      file == null ||
+      file.cacheKey == null ||
+      workerManager == null ||
+      isFilePlainText(file)
+    ) {
+      return;
+    }
+    const lines = this.fileRenderer.getOrCreateLineCache(file);
+    if (
+      lines.length >
+      (this.options.tokenizeMaxLength ?? DEFAULT_TOKENIZE_MAX_LENGTH)
+    ) {
+      return;
+    }
+    workerManager.primeFileHighlightCache(file);
   }
 
   private cleanChildNodes() {
@@ -611,11 +738,14 @@ export class File<LAnnotation = undefined> {
     this.spriteSVG = undefined;
     this.themeCSSStyle = undefined;
     this.appliedThemeCSS = undefined;
+    this.hasAdoptedThemeCSS = false;
     this.unsafeCSSStyle = undefined;
     this.appliedUnsafeCSS = undefined;
 
     this.lastRenderedHeaderHTML = undefined;
     this.lastRowCount = undefined;
+
+    this.mounted = false;
   }
 
   private renderAnnotations(): void {
@@ -663,8 +793,7 @@ export class File<LAnnotation = undefined> {
   }
 
   private renderGutterUtility() {
-    const renderGutterUtility =
-      this.options.renderGutterUtility ?? this.options.renderHoverUtility;
+    const { renderGutterUtility } = this.options;
     if (this.fileContainer == null || renderGutterUtility == null) {
       this.gutterUtilityContent?.remove();
       this.gutterUtilityContent = undefined;
@@ -726,26 +855,59 @@ export class File<LAnnotation = undefined> {
     const shadowRoot =
       container.shadowRoot ?? container.attachShadow({ mode: 'open' });
     const effectiveThemeType = baseThemeType ?? themeType;
+    const currentTheme = this.options.theme ?? DEFAULT_THEMES;
+    const theme =
+      typeof currentTheme === 'string' ? currentTheme : { ...currentTheme };
+    const scrollbarGutter = getMeasuredScrollbarGutter(shadowRoot);
     if (
       this.themeCSSStyle?.parentNode === shadowRoot &&
       this.appliedThemeCSS?.themeStyles === themeStyles &&
-      this.appliedThemeCSS.themeType === effectiveThemeType
+      this.appliedThemeCSS.themeType === effectiveThemeType &&
+      this.appliedThemeCSS.scrollbarGutter === scrollbarGutter
     ) {
+      this.appliedThemeCSS.theme = theme;
+      return;
+    }
+    if (
+      this.hasAdoptedThemeCSS &&
+      this.themeCSSStyle?.parentNode === shadowRoot
+    ) {
+      this.hasAdoptedThemeCSS = false;
+      this.appliedThemeCSS = {
+        theme,
+        themeStyles,
+        themeType: effectiveThemeType,
+        baseThemeType,
+        scrollbarGutter,
+      };
       return;
     }
     this.themeCSSStyle = upsertHostThemeStyle({
       shadowRoot,
       currentNode: this.themeCSSStyle,
-      themeCSS: wrapThemeCSS(themeStyles, effectiveThemeType),
+      themeCSS: wrapThemeCSS(themeStyles, effectiveThemeType, scrollbarGutter),
     });
     this.appliedThemeCSS =
       this.themeCSSStyle != null
         ? {
+            theme,
             themeStyles,
             themeType: effectiveThemeType,
             baseThemeType,
+            scrollbarGutter,
           }
         : undefined;
+  }
+
+  private hydrateMeasuredScrollbar(): void {
+    const shadowRoot = this.fileContainer?.shadowRoot;
+    if (shadowRoot == null || this.themeCSSStyle == null) {
+      return;
+    }
+    this.themeCSSStyle.textContent = patchScrollbarGutterSize(
+      this.themeCSSStyle.textContent ?? '',
+      getMeasuredScrollbarGutter(shadowRoot)
+    );
   }
 
   private applyFullRender(result: FileRenderResult, pre: HTMLPreElement): void {
@@ -961,8 +1123,7 @@ export class File<LAnnotation = undefined> {
     pre: HTMLPreElement,
     renderRange: RenderRange | undefined
   ) {
-    const { disableVirtualizationBuffers = false } = this.options;
-    if (disableVirtualizationBuffers || renderRange == null) {
+    if (renderRange == null || this.shouldDisableVirtualizationBuffers()) {
       if (this.bufferBefore != null) {
         this.bufferBefore.remove();
         this.bufferBefore = undefined;
@@ -1007,6 +1168,10 @@ export class File<LAnnotation = undefined> {
     }
   }
 
+  protected shouldDisableVirtualizationBuffers(): boolean {
+    return this.options.disableVirtualizationBuffers ?? false;
+  }
+
   private applyHeaderToDOM(
     headerAST: HASTElement,
     container: HTMLElement
@@ -1016,7 +1181,8 @@ export class File<LAnnotation = undefined> {
     this.cleanupErrorWrapper();
     this.placeHolder?.remove();
     this.placeHolder = undefined;
-    const headerHTML = toHtml(headerAST);
+    const headerHTML = this.cachedHeaderHTML ?? toHtml(headerAST);
+    this.cachedHeaderHTML = headerHTML;
     if (headerHTML !== this.lastRenderedHeaderHTML) {
       const tempDiv = document.createElement('div');
       tempDiv.innerHTML = headerHTML;
@@ -1035,7 +1201,7 @@ export class File<LAnnotation = undefined> {
 
     if (this.isContainerManaged) return;
 
-    const { renderHeaderPrefix, renderCustomHeader, renderCustomMetadata } =
+    const { renderHeaderPrefix, renderCustomHeader, renderHeaderMetadata } =
       this.options;
 
     if (renderCustomHeader != null) {
@@ -1052,7 +1218,7 @@ export class File<LAnnotation = undefined> {
       this.headerMetadata = undefined;
     } else {
       const prefix = renderHeaderPrefix?.(file) ?? undefined;
-      const content = renderCustomMetadata?.(file) ?? undefined;
+      const content = renderHeaderMetadata?.(file) ?? undefined;
       this.headerPrefix = this.upsertHeaderSlotElement(
         container,
         this.headerPrefix,
@@ -1120,28 +1286,76 @@ export class File<LAnnotation = undefined> {
     fileContainer?: HTMLElement,
     parentNode?: HTMLElement
   ): HTMLElement {
-    const previousContainer = this.fileContainer;
-    this.fileContainer =
+    const { fileContainer: previousContainer } = this;
+    const nextContainer =
       fileContainer ??
-      this.fileContainer ??
+      previousContainer ??
       document.createElement(DIFFS_TAG_NAME);
-    if (previousContainer != null && previousContainer !== this.fileContainer) {
+    const containerChanged = previousContainer !== nextContainer;
+    if (containerChanged) {
+      this.emitPostRender(true);
+    }
+    this.fileContainer = nextContainer;
+    if (previousContainer != null && containerChanged) {
       this.lastRenderedHeaderHTML = undefined;
       this.headerElement = undefined;
     }
     if (parentNode != null && this.fileContainer.parentNode !== parentNode) {
       parentNode.appendChild(this.fileContainer);
     }
+    if (containerChanged) {
+      this.adoptReusableShellElements(this.fileContainer);
+    }
+    this.ensureSpriteSVG(this.fileContainer);
+    return this.fileContainer;
+  }
+
+  // NOTE(amadeus): Technically this method is not safe for use outside of
+  // the CodeView component, however I don't think in practice it really
+  // should matter, but maybe there's some system we need in place to prevent
+  // this from running outside of that environment?
+  //
+  // It's making very specific assumptions that all the elements will have the
+  // correct content based on CodeView global options
+  private adoptReusableShellElements(fileContainer: HTMLElement): void {
+    const { shadowRoot } = fileContainer;
+    if (shadowRoot == null) {
+      return;
+    }
+
+    for (const element of shadowRoot.children) {
+      if (element instanceof SVGElement) {
+        this.spriteSVG ??= element;
+      } else if (
+        isStyleNode(element) &&
+        element.hasAttribute(THEME_CSS_ATTRIBUTE)
+      ) {
+        this.themeCSSStyle ??= element;
+        this.hasAdoptedThemeCSS = true;
+      } else if (
+        isStyleNode(element) &&
+        element.hasAttribute(UNSAFE_CSS_ATTRIBUTE)
+      ) {
+        this.unsafeCSSStyle ??= element;
+        this.appliedUnsafeCSS ??= this.options.unsafeCSS ?? undefined;
+      }
+    }
+  }
+
+  private ensureSpriteSVG(fileContainer: HTMLElement): void {
+    const shadowRoot =
+      fileContainer.shadowRoot ?? fileContainer.attachShadow({ mode: 'open' });
     if (this.spriteSVG == null) {
       const fragment = document.createElement('div');
       fragment.innerHTML = SVGSpriteSheet;
       const firstChild = fragment.firstChild;
       if (firstChild instanceof SVGElement) {
         this.spriteSVG = firstChild;
-        this.fileContainer.shadowRoot?.appendChild(this.spriteSVG);
       }
     }
-    return this.fileContainer;
+    if (this.spriteSVG != null && this.spriteSVG.parentNode !== shadowRoot) {
+      shadowRoot.appendChild(this.spriteSVG);
+    }
   }
 
   private getOrCreatePreNode(container: HTMLElement): HTMLPreElement {
@@ -1203,16 +1417,14 @@ export class File<LAnnotation = undefined> {
 
   private applyErrorToDOM(error: Error, container: HTMLElement) {
     this.cleanupErrorWrapper();
-    const pre = this.getOrCreatePreNode(container);
-    pre.innerHTML = '';
-    pre.remove();
+    this.pre?.remove();
     this.pre = undefined;
     this.appliedPreAttributes = undefined;
     const shadowRoot =
       container.shadowRoot ?? container.attachShadow({ mode: 'open' });
     this.errorWrapper ??= document.createElement('div');
     this.errorWrapper.dataset.errorWrapper = '';
-    this.errorWrapper.innerHTML = '';
+    this.errorWrapper.textContent = '';
     shadowRoot.appendChild(this.errorWrapper);
     const errorMessage = document.createElement('div');
     errorMessage.dataset.errorMessage = '';
@@ -1228,4 +1440,20 @@ export class File<LAnnotation = undefined> {
     this.errorWrapper?.remove();
     this.errorWrapper = undefined;
   }
+}
+
+function shouldRenderCode(
+  pre: HTMLPreElement | undefined,
+  file: FileContents | undefined,
+  collapsed = false
+): boolean {
+  return !collapsed && pre == null && file != null;
+}
+
+function shouldRenderHeader(
+  headerElement: HTMLElement | undefined,
+  file: FileContents | undefined,
+  disableFileHeader: boolean = false
+): boolean {
+  return headerElement == null && file != null && !disableFileHeader;
 }

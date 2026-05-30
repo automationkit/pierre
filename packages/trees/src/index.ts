@@ -1,12 +1,16 @@
 export * from './constants';
-export type { GitStatus, GitStatusEntry, ContextMenuAnchorRect } from './types';
+export type {
+  ContextMenuAnchorRect,
+  GitStatus,
+  GitStatusEntry,
+} from './publicTypes';
 export type {
   FileTreeBuiltInIconSet,
   FileTreeIconConfig,
   FileTreeIcons,
   RemappedIcon,
 } from './iconConfig';
-export { getBuiltInFileIconColor, getBuiltInSpriteSheet } from './builtInIcons';
+export { getBuiltInSpriteSheet } from './builtInIcons';
 export { createFileTreeIconResolver } from './render/iconResolver';
 export type {
   TreeThemeInput,
@@ -46,6 +50,7 @@ export type {
   FileTreeDropResult,
   FileTreeDropTarget,
   FileTreeFileHandle,
+  FileTreeGitStatusPatch,
   FileTreeHeaderCompositionOptions,
   FileTreeHydrationProps,
   FileTreeInitialExpansion,
@@ -76,10 +81,11 @@ export type {
   FileTreeSearchChangeListener,
   FileTreeSearchMode,
   FileTreeSearchSessionHandle,
+  FileTreeScrollOffset,
+  FileTreeScrollToPathOptions,
   FileTreeSelectionChangeListener,
-  FileTreeSlotHost,
   FileTreeSortComparator,
   FileTreeSortEntry,
   FileTreeSsrPayload,
   FileTreeVisibleRow,
-} from './model/types';
+} from './model/publicTypes';

@@ -1,14 +1,24 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 
+import { disposeHighlighter } from '../src/highlighter/shared_highlighter';
 import { DiffHunksRenderer } from '../src/renderers/DiffHunksRenderer';
-import { parsePatchFiles } from '../src/utils/parsePatchFiles';
-import { diffPatch, finalBlankLinePatch, malformedPatch } from './mocks';
+import { parsePatchFiles, processFile } from '../src/utils/parsePatchFiles';
+import {
+  diffPatch,
+  finalBlankLinePatch,
+  formatPatchWithVersionTrailer,
+  malformedPatch,
+} from './mocks';
 import {
   assertDefined,
   countRenderedLines,
   countSplitRows,
   verifyPatchHunkValues,
 } from './testUtils';
+
+afterAll(async () => {
+  await disposeHighlighter();
+});
 
 describe('parsePatchFiles', () => {
   const result = parsePatchFiles(diffPatch);
@@ -35,18 +45,94 @@ describe('parsePatchFiles', () => {
         console.log('  * test expected console.error:', args);
       }
     );
-    const result = parsePatchFiles(malformedPatch);
+    try {
+      const result = parsePatchFiles(malformedPatch);
 
-    // Should have logged an error for the invalid line, but should still try
-    // to do its best to parse things out
-    expect(consoleError).toHaveBeenCalled();
-    expect(consoleError.mock.calls[0][0]).toContain('Invalid firstChar');
+      // Should have logged an error for the invalid line, but should still try
+      // to do its best to parse things out
+      expect(consoleError).toHaveBeenCalled();
+      expect(consoleError.mock.calls[0][0]).toContain('Invalid firstChar');
 
-    // The hunk counts should be off by 1 due to the missing line
-    const hunk = result[0].files[0].hunks[0];
-    expect(hunk.deletionCount).toBe(87);
-    expect(hunk.deletionLines).toBe(86);
-    expect(result).toMatchSnapshot('malformed patch');
+      // The hunk counts should be off by 1 due to the missing line
+      const hunk = result[0].files[0].hunks[0];
+      expect(hunk.deletionCount).toBe(87);
+      expect(hunk.deletionLines).toBe(86);
+      expect(result).toMatchSnapshot('malformed patch');
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('ignores format-patch version trailers after the final hunk', () => {
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = parsePatchFiles(formatPatchWithVersionTrailer);
+      const { valid, errors } = verifyPatchHunkValues(result);
+      if (!valid) {
+        console.error('Hunk line value errors:', errors);
+      }
+
+      expect(consoleError).not.toHaveBeenCalled();
+      expect(valid).toBe(true);
+      expect(result[0].files[0].hunks[0].additionLines).toBe(1);
+      expect(result[0].files[0].hunks[0].deletionLines).toBe(0);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('preserves leading BOM characters in parsed hunk lines', () => {
+    const result = parsePatchFiles(
+      [
+        'diff --git a/bom.txt b/bom.txt\n',
+        'index 1111111..2222222 100644\n',
+        '--- a/bom.txt\n',
+        '+++ b/bom.txt\n',
+        '@@ -1 +1 @@\n',
+        '-\uFEFFold\n',
+        '+\uFEFFnew\n',
+      ].join('')
+    );
+
+    const file = result[0]?.files[0];
+    expect(file?.deletionLines[0]).toBe('\uFEFFold\n');
+    expect(file?.additionLines[0]).toBe('\uFEFFnew\n');
+  });
+
+  test('preserves lone surrogate characters in parsed hunk lines', () => {
+    const result = parsePatchFiles(
+      [
+        'diff --git a/surrogate.txt b/surrogate.txt\n',
+        'index 1111111..2222222 100644\n',
+        '--- a/surrogate.txt\n',
+        '+++ b/surrogate.txt\n',
+        '@@ -1 +1 @@\n',
+        '-old\ud800\n',
+        '+new\ud800\n',
+      ].join('')
+    );
+
+    const file = result[0]?.files[0];
+    expect(file?.deletionLines[0]).toBe('old\ud800\n');
+    expect(file?.additionLines[0]).toBe('new\ud800\n');
+  });
+
+  test('parses quoted git diff headers with escaped file names', () => {
+    const oldName =
+      'test/integration/image-optimizer/app/public/\\303\\244\\303\\266\\303\\274\\305\\241\\304\\215\\305\\231\\303\\255.png';
+    const newName =
+      'test/e2e/image-optimizer/app/public/\\303\\244\\303\\266\\303\\274\\305\\241\\304\\215\\305\\231\\303\\255.png';
+    const file = processFile(
+      [
+        `diff --git "a/${oldName}" "b/${newName}"\n`,
+        'similarity index 100%\n',
+      ].join(''),
+      { isGitDiff: true }
+    );
+
+    expect(file?.name).toBe(newName);
+    expect(file?.prevName).toBe(oldName);
+    expect(file?.type).toBe('rename-pure');
   });
 
   test(

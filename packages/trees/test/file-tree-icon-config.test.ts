@@ -2,76 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { JSDOM } from 'jsdom';
 
 import { serializeFileTreeSsrPayload } from '../src/ssr';
-
-function installDom() {
-  const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
-    url: 'http://localhost',
-  });
-  const originalValues = {
-    CSSStyleSheet: Reflect.get(globalThis, 'CSSStyleSheet'),
-    customElements: Reflect.get(globalThis, 'customElements'),
-    document: Reflect.get(globalThis, 'document'),
-    Event: Reflect.get(globalThis, 'Event'),
-    HTMLElement: Reflect.get(globalThis, 'HTMLElement'),
-    HTMLButtonElement: Reflect.get(globalThis, 'HTMLButtonElement'),
-    HTMLDivElement: Reflect.get(globalThis, 'HTMLDivElement'),
-    HTMLStyleElement: Reflect.get(globalThis, 'HTMLStyleElement'),
-    HTMLTemplateElement: Reflect.get(globalThis, 'HTMLTemplateElement'),
-    MutationObserver: Reflect.get(globalThis, 'MutationObserver'),
-    navigator: Reflect.get(globalThis, 'navigator'),
-    Node: Reflect.get(globalThis, 'Node'),
-    ResizeObserver: Reflect.get(globalThis, 'ResizeObserver'),
-    SVGElement: Reflect.get(globalThis, 'SVGElement'),
-    ShadowRoot: Reflect.get(globalThis, 'ShadowRoot'),
-    window: Reflect.get(globalThis, 'window'),
-  };
-
-  class MockStyleSheet {
-    replaceSync(_value: string): void {}
-  }
-
-  class MockResizeObserver {
-    observe(_target: Element): void {}
-    disconnect(): void {}
-  }
-
-  Object.assign(globalThis, {
-    CSSStyleSheet: MockStyleSheet,
-    customElements: dom.window.customElements,
-    document: dom.window.document,
-    Event: dom.window.Event,
-    HTMLElement: dom.window.HTMLElement,
-    HTMLButtonElement: dom.window.HTMLButtonElement,
-    HTMLDivElement: dom.window.HTMLDivElement,
-    HTMLStyleElement: dom.window.HTMLStyleElement,
-    HTMLTemplateElement: dom.window.HTMLTemplateElement,
-    MutationObserver: dom.window.MutationObserver,
-    navigator: dom.window.navigator,
-    Node: dom.window.Node,
-    ResizeObserver: MockResizeObserver,
-    SVGElement: dom.window.SVGElement,
-    ShadowRoot: dom.window.ShadowRoot,
-    window: dom.window,
-  });
-
-  return {
-    cleanup() {
-      for (const [key, value] of Object.entries(originalValues)) {
-        if (value === undefined) {
-          Reflect.deleteProperty(globalThis, key);
-        } else {
-          Object.assign(globalThis, { [key]: value });
-        }
-      }
-      dom.window.close();
-    },
-    dom,
-  };
-}
-
-async function flushDom(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
+import { flushDom, installDom } from './helpers/dom';
 
 function getItemButton(
   shadowRoot: ShadowRoot | null | undefined,
@@ -165,6 +96,53 @@ describe('file-tree icon config', () => {
         readmeButton.querySelector('use')?.getAttribute('href') ?? '';
 
       expect(href.startsWith('#file-tree-builtin-')).toBe(true);
+      fileTree.cleanUp();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('remap[file-tree-icon-file] overrides the default built-in fallback when set is complete', async () => {
+    const { cleanup, dom } = installDom();
+    try {
+      const { FileTree } = await import('../src/render/FileTree');
+      const mount = dom.window.document.createElement('div');
+      dom.window.document.body.appendChild(mount);
+
+      const fileTree = new FileTree({
+        flattenEmptyDirectories: true,
+        icons: {
+          set: 'complete',
+          spriteSheet:
+            '<svg data-icon-sprite aria-hidden="true" width="0" height="0"><symbol id="pst-test-generic-file" viewBox="0 0 16 16"><rect width="16" height="16" fill="currentColor" /></symbol></svg>',
+          remap: {
+            'file-tree-icon-file': 'pst-test-generic-file',
+          },
+        },
+        initialExpansion: 'open',
+        paths: ['unknown.xyz', 'src/index.ts'],
+        initialVisibleRowCount: 120 / 30,
+      });
+
+      fileTree.render({ containerWrapper: mount });
+      await flushDom();
+
+      const shadowRoot = fileTree.getFileTreeContainer()?.shadowRoot;
+
+      // Unknown extension has no specific built-in token — remap should win
+      // over the generic 'default' fallback.
+      const unknownButton = getItemButton(shadowRoot, dom, 'unknown.xyz');
+      expect(unknownButton.querySelector('use')?.getAttribute('href')).toBe(
+        '#pst-test-generic-file'
+      );
+
+      // Known extension has a specific built-in token — remap must not
+      // override it.
+      const tsButton = getItemButton(shadowRoot, dom, 'src/index.ts');
+      expect(tsButton.querySelector('use')?.getAttribute('href')).toBe(
+        '#file-tree-builtin-typescript'
+      );
+
       fileTree.cleanUp();
     } finally {
       cleanup();
